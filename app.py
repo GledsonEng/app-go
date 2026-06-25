@@ -120,6 +120,7 @@ STATUS_COLORS = {
     "Aguardando avaliação": "#F2B705", "Interdição": "#E8820E",
 }
 STATUS_ORDER = list(STATUS_COLORS.keys())
+STATUS_FALLBACK = "#6B7B78"   # cor neutra p/ status novos criados pelo ADM
 MESES = {1: "jan", 2: "fev", 3: "mar", 4: "abr", 5: "mai", 6: "jun",
          7: "jul", 8: "ago", 9: "set", 10: "out", 11: "nov", 12: "dez"}
 
@@ -136,7 +137,7 @@ COLMAP = {
     "comentarios": "Comentários", "plano_acao": "Plano de Ação",
 }
 
-LISTAS = {
+LISTAS_DEFAULT = {
     "Área do Solicitante": ["Planejamento curto / Médio prazo", "Usina", "Outros",
         "Terraplenagem N4", "Hidrogeologia", "Operação de Mina Autônoma",
         "Terraplenagem N5", "Geotecnia", "Meio Ambiente", "Operação de Mina N4",
@@ -282,6 +283,43 @@ def atualizar_demanda(id_alvo, campos: dict):
         conn.execute(sql, params)
 
 
+# ---- Listas de opções (master data editável pelo ADM) ----
+LISTAS_GERENCIAVEIS = ["Complexo", "Área do Solicitante", "Tipo de Solicitação",
+                       "Tipo de Estrutura", "Estrutura", "Status",
+                       "Responsável pela avaliação", "Solicitante"]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def carregar_listas():
+    """Lê as opções do banco; usa o padrão se a tabela ainda não existir."""
+    base = {k: list(v) for k, v in LISTAS_DEFAULT.items()}
+    try:
+        dl = pd.read_sql("SELECT lista, valor FROM listas_opcoes ORDER BY valor", engine)
+        do_banco = {}
+        for _, r in dl.iterrows():
+            do_banco.setdefault(r["lista"], []).append(r["valor"])
+        for k, v in do_banco.items():
+            if v:
+                base[k] = v
+    except Exception:
+        pass
+    base.setdefault("Solicitante", [])
+    return base
+
+
+def lista_add(lista, valor):
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO listas_opcoes (lista, valor) VALUES (:l, :v) "
+            "ON CONFLICT (lista, valor) DO NOTHING"), {"l": lista, "v": valor})
+
+
+def lista_del(lista, valor):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM listas_opcoes WHERE lista = :l AND valor = :v"),
+                     {"l": lista, "v": valor})
+
+
 # ================================================================== #
 #  PÁGINA: HOME
 # ================================================================== #
@@ -318,28 +356,36 @@ def pg_cadastro():
     if not _base_ok():
         return
     st.caption("O ID é gerado automaticamente pelo banco de dados.")
+    LIS = carregar_listas()
     with st.form("form_cad", clear_on_submit=True):
         c1, c2 = st.columns(2)
         with c1:
-            solicitante = st.text_input("Solicitante *")
-            complexo = st.selectbox("Complexo *", LISTAS["Complexo"])
-            tipo_estrutura = st.selectbox("Tipo de Estrutura *", LISTAS["Tipo de Estrutura"])
+            solicitante_sel = st.selectbox("Solicitante *", ["(selecione)"] + LIS.get("Solicitante", []))
+            solicitante_novo = st.text_input("…ou novo solicitante (se não estiver na lista)")
+            complexo = st.selectbox("Complexo *", LIS["Complexo"])
+            tipo_estrutura = st.selectbox("Tipo de Estrutura *", LIS["Tipo de Estrutura"])
             localizacao = st.text_area("Localização da Estrutura", height=90)
             coord_x = st.number_input("Coordenada X (WGS84)", format="%.6f", value=0.0)
         with c2:
-            area = st.selectbox("Área do Solicitante *", LISTAS["Área do Solicitante"])
-            tipo_solic = st.selectbox("Tipo de Solicitação *", LISTAS["Tipo de Solicitação"])
-            estrutura = st.selectbox("Estrutura *", LISTAS["Estrutura"])
+            area = st.selectbox("Área do Solicitante *", LIS["Área do Solicitante"])
+            tipo_solic = st.selectbox("Tipo de Solicitação *", LIS["Tipo de Solicitação"])
+            estrutura = st.selectbox("Estrutura *", LIS["Estrutura"])
             descricao = st.text_area("Descrição do Evento ou Projeto", height=90)
             coord_y = st.number_input("Coordenada Y (WGS84)", format="%.6f", value=0.0)
         st.caption("Obs.: o solicitante deverá acompanhar em campo as tratativas com o "
                    "geotécnico responsável. Telefone da Geomecânica: (94) 99944-2667.")
         enviar = st.form_submit_button("ENVIAR SOLICITAÇÃO", type="primary", use_container_width=True)
     if enviar:
-        if not solicitante.strip():
-            st.error("Informe o Solicitante.")
+        solic = solicitante_novo.strip() or ("" if solicitante_sel == "(selecione)" else solicitante_sel)
+        if not solic:
+            st.error("Informe o Solicitante (selecione na lista ou digite um novo).")
         else:
-            reg = {"data_criacao": date.today(), "solicitante": solicitante.strip(),
+            if solicitante_novo.strip() and solicitante_novo.strip() not in LIS.get("Solicitante", []):
+                try:
+                    lista_add("Solicitante", solicitante_novo.strip())
+                except Exception:
+                    pass
+            reg = {"data_criacao": date.today(), "solicitante": solic,
                    "area_solicitante": area, "complexo": complexo,
                    "tipo_solicitacao": tipo_solic, "tipo_estrutura": tipo_estrutura,
                    "estrutura": estrutura, "localizacao": localizacao.strip(),
@@ -408,13 +454,14 @@ def pg_gestao():
         v = "" if pd.isna(valor) else str(valor)
         return opts, (opts.index(v) if v in opts else 0)
 
+    LIS = carregar_listas()
     with st.form("form_gestao"):
         st.markdown("###### Atualizar avaliação")
         g1, g2 = st.columns(2)
         with g1:
-            op_st, ix_st = _idx(STATUS_ORDER, linha["Status"])
+            op_st, ix_st = _idx(LIS.get("Status", STATUS_ORDER), linha["Status"])
             novo_status = st.selectbox("Status", op_st, index=ix_st)
-            op_rp, ix_rp = _idx(LISTAS["Responsável pela avaliação"],
+            op_rp, ix_rp = _idx(LIS["Responsável pela avaliação"],
                                 linha["Responsável pela avaliação"], extra0="(a definir)")
             novo_resp = st.selectbox("Responsável pela avaliação", op_rp, index=ix_rp)
             aprovador = st.text_input("Aprovador",
@@ -443,6 +490,52 @@ def pg_gestao():
             st.success(f"Demanda ID {alvo} atualizada com sucesso!")
         except Exception as e:
             st.error(f"Erro ao salvar: {e}")
+
+    # ---------------- Gerenciar listas de opções ----------------
+    st.divider()
+    with st.expander("⚙️ Gerenciar listas de opções (adicionar / excluir)"):
+        st.caption("As alterações refletem nos menus de Cadastramento e Gestão. "
+                   "Excluir uma opção da lista não altera as solicitações já registradas.")
+        LIS_G = carregar_listas()
+        nome_lista = st.selectbox("Escolha a lista", LISTAS_GERENCIAVEIS, key="sel_lista_g")
+        valores = LIS_G.get(nome_lista, [])
+        st.markdown(f"**Opções atuais de _{nome_lista}_ — {len(valores)} item(ns):**")
+        if valores:
+            st.dataframe(pd.DataFrame({nome_lista: valores}),
+                         use_container_width=True, hide_index=True, height=220)
+        else:
+            st.info("Esta lista ainda não possui opções cadastradas.")
+        ca, cb = st.columns(2)
+        with ca:
+            novo_v = st.text_input("Adicionar nova opção", key="add_opt_g")
+            if st.button("➕ Adicionar", use_container_width=True, key="btn_add_g"):
+                v = novo_v.strip()
+                if not v:
+                    st.warning("Digite um valor para adicionar.")
+                elif v in valores:
+                    st.warning("Essa opção já existe na lista.")
+                else:
+                    try:
+                        lista_add(nome_lista, v)
+                        st.cache_data.clear()
+                        st.success(f"'{v}' adicionado a {nome_lista}.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao adicionar: {e}")
+        with cb:
+            if valores:
+                rem_v = st.selectbox("Excluir opção", ["(selecione)"] + valores, key="del_opt_g")
+                if st.button("🗑️ Excluir", use_container_width=True, key="btn_del_g"):
+                    if rem_v == "(selecione)":
+                        st.warning("Selecione uma opção para excluir.")
+                    else:
+                        try:
+                            lista_del(nome_lista, rem_v)
+                            st.cache_data.clear()
+                            st.success(f"'{rem_v}' excluído de {nome_lista}.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro ao excluir: {e}")
 
 
 # ================================================================== #
@@ -489,6 +582,14 @@ def pg_dashboard():
         st.info("Nenhum registro para os filtros selecionados.")
         return
 
+    # Ordem e cores de Status — dinâmicas (inclui status novos criados pelo ADM)
+    _LIS = carregar_listas()
+    STAT_ORD = list(_LIS.get("Status") or STATUS_ORDER)
+    for _s in dados["Status"].dropna().unique():
+        if _s not in STAT_ORD:
+            STAT_ORD.append(_s)
+    SMAP = {s: STATUS_COLORS.get(s, STATUS_FALLBACK) for s in STAT_ORD}
+
     LAYOUT = dict(margin=dict(l=10, r=10, t=10, b=10),
                   paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                   legend=dict(orientation="h", yanchor="top", y=-0.32, x=0.5,
@@ -501,9 +602,9 @@ def pg_dashboard():
     def painel(t): st.markdown(f'<h4 class="painel">{t}</h4>', unsafe_allow_html=True)
 
     def g_status(d):
-        c = d["Status"].value_counts().reindex(STATUS_ORDER).dropna().reset_index()
+        c = d["Status"].value_counts().reindex(STAT_ORD).dropna().reset_index()
         c.columns = ["Status", "qtd"]
-        fig = px.bar(c, x="Status", y="qtd", text="qtd", color="Status", color_discrete_map=STATUS_COLORS)
+        fig = px.bar(c, x="Status", y="qtd", text="qtd", color="Status", color_discrete_map=SMAP)
         fig.update_traces(textposition="outside", showlegend=False, cliponaxis=False)
         fig.update_layout(**LAYOUT, xaxis_title=None, yaxis_title=None, height=320)
         fig.update_yaxes(visible=False)
@@ -515,13 +616,13 @@ def pg_dashboard():
         if horizontal:
             tot = g.groupby(col)["qtd"].sum().sort_values().index.tolist()
             fig = px.bar(g, y=col, x="qtd", color="Status", orientation="h",
-                         color_discrete_map=STATUS_COLORS,
-                         category_orders={col: tot, "Status": STATUS_ORDER})
+                         color_discrete_map=SMAP,
+                         category_orders={col: tot, "Status": STAT_ORD})
             fig.update_xaxes(visible=False)
             fig.update_yaxes(**TICK)
         else:
-            fig = px.bar(g, x=col, y="qtd", color="Status", color_discrete_map=STATUS_COLORS,
-                         category_orders={col: ordem_x or sorted(g[col].unique()), "Status": STATUS_ORDER})
+            fig = px.bar(g, x=col, y="qtd", color="Status", color_discrete_map=SMAP,
+                         category_orders={col: ordem_x or sorted(g[col].unique()), "Status": STAT_ORD})
             fig.update_yaxes(visible=False)
             fig.update_xaxes(tickangle=-45, **TICK)
         fig.update_layout(**LAYOUT, height=height, barmode="stack", xaxis_title=None, yaxis_title=None)
