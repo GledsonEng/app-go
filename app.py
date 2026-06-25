@@ -491,8 +491,12 @@ def pg_dashboard():
 
     LAYOUT = dict(margin=dict(l=10, r=10, t=10, b=10),
                   paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                  legend=dict(orientation="h", yanchor="bottom", y=-0.3, x=0, font=dict(size=10)),
-                  font=dict(size=11, color="#333"))
+                  legend=dict(orientation="h", yanchor="top", y=-0.32, x=0.5,
+                              xanchor="center", font=dict(size=10, color="#d6dedb"),
+                              title=dict(text="")),
+                  font=dict(size=11, color="#d6dedb"))
+    # eixos: rótulos claros e reserva de espaço automática (evita corte/sobreposição)
+    TICK = dict(tickfont=dict(size=10, color="#cdd6d3"), automargin=True)
 
     def painel(t): st.markdown(f'<h4 class="painel">{t}</h4>', unsafe_allow_html=True)
 
@@ -500,11 +504,13 @@ def pg_dashboard():
         c = d["Status"].value_counts().reindex(STATUS_ORDER).dropna().reset_index()
         c.columns = ["Status", "qtd"]
         fig = px.bar(c, x="Status", y="qtd", text="qtd", color="Status", color_discrete_map=STATUS_COLORS)
-        fig.update_traces(textposition="outside", showlegend=False)
-        fig.update_layout(**LAYOUT, xaxis_title=None, yaxis_title=None, height=300)
-        fig.update_yaxes(visible=False); fig.update_xaxes(tickangle=-30); return fig
+        fig.update_traces(textposition="outside", showlegend=False, cliponaxis=False)
+        fig.update_layout(**LAYOUT, xaxis_title=None, yaxis_title=None, height=320)
+        fig.update_yaxes(visible=False)
+        fig.update_xaxes(tickangle=-25, **TICK)
+        return fig
 
-    def g_emp(d, col, horizontal=False, height=320, ordem_x=None):
+    def g_emp(d, col, horizontal=False, height=340, ordem_x=None):
         g = d.groupby([col, "Status"]).size().reset_index(name="qtd")
         if horizontal:
             tot = g.groupby(col)["qtd"].sum().sort_values().index.tolist()
@@ -512,20 +518,24 @@ def pg_dashboard():
                          color_discrete_map=STATUS_COLORS,
                          category_orders={col: tot, "Status": STATUS_ORDER})
             fig.update_xaxes(visible=False)
+            fig.update_yaxes(**TICK)
         else:
             fig = px.bar(g, x=col, y="qtd", color="Status", color_discrete_map=STATUS_COLORS,
                          category_orders={col: ordem_x or sorted(g[col].unique()), "Status": STATUS_ORDER})
             fig.update_yaxes(visible=False)
+            fig.update_xaxes(tickangle=-45, **TICK)
         fig.update_layout(**LAYOUT, height=height, barmode="stack", xaxis_title=None, yaxis_title=None)
         return fig
 
-    def g_cont(d, col, height=300):
+    def g_cont(d, col, height=320):
         c = d[col].value_counts().reset_index(); c.columns = [col, "qtd"]
         c = c.sort_values("qtd", ascending=False)
         fig = px.bar(c, x=col, y="qtd", text="qtd")
-        fig.update_traces(marker_color=BLUE, textposition="outside")
+        fig.update_traces(marker_color=BLUE, textposition="outside", cliponaxis=False)
         fig.update_layout(**LAYOUT, height=height, xaxis_title=None, yaxis_title=None, showlegend=False)
-        fig.update_yaxes(visible=False); fig.update_xaxes(tickangle=-45); return fig
+        fig.update_yaxes(visible=False)
+        fig.update_xaxes(tickangle=-45, **TICK)
+        return fig
 
     c1, c2, c3 = st.columns(3)
     with c1:
