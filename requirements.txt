@@ -3,3 +3,6 @@ pandas
 plotly
 sqlalchemy
 psycopg2-binary
+pillow
+folium
+streamlit-folium

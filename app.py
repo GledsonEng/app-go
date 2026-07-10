@@ -59,6 +59,8 @@ def _bootstrap():
     _self = _resolver_self()
     necessarios = [("pandas", "pandas"), ("plotly", "plotly"),
                    ("sqlalchemy", "sqlalchemy"), ("psycopg2", "psycopg2-binary"),
+                   ("PIL", "pillow"), ("folium", "folium"),
+                   ("streamlit_folium", "streamlit-folium"),
                    ("streamlit", "streamlit")]
     faltando = [pip for mod, pip in necessarios if importlib.util.find_spec(mod) is None]
     if faltando:
@@ -78,6 +80,7 @@ if not _sob_streamlit():
 # 1. IMPORTS / CONFIG
 # ------------------------------------------------------------------ #
 from datetime import date
+import io
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -320,6 +323,83 @@ def lista_del(lista, valor):
                      {"l": lista, "v": valor})
 
 
+# ---- Anexos de fotos (armazenados no próprio banco) ----
+MAX_FOTOS = 5
+MAX_BYTES_FOTO = 1_000_000        # 1 MB por foto (após compressão)
+MAX_BYTES_TOTAL = 5_000_000       # 5 MB por solicitação
+MAX_LADO_PX = 1920                # maior lado da imagem
+
+
+def comprimir_imagem(file_bytes):
+    """Redimensiona (máx. 1920px) e comprime em JPEG mirando <= 1 MB.
+    Se necessário, reduz a dimensão progressivamente para respeitar o teto.
+    Retorna bytes JPEG ou levanta exceção se a imagem não puder ser processada."""
+    from PIL import Image, ImageOps
+    img = Image.open(io.BytesIO(file_bytes))
+    img = ImageOps.exif_transpose(img)            # respeita orientação da câmera
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    def _redimensionar(im, lado):
+        w, h = im.size
+        if max(w, h) <= lado:
+            return im
+        if w >= h:
+            return im.resize((lado, max(1, round(h * lado / w))), Image.LANCZOS)
+        return im.resize((max(1, round(w * lado / h)), lado), Image.LANCZOS)
+
+    lado, dados = MAX_LADO_PX, None
+    for _ in range(6):
+        base = _redimensionar(img, lado)
+        for q in (85, 82, 80, 78, 75, 70, 65, 60):
+            buf = io.BytesIO()
+            base.save(buf, format="JPEG", quality=q, optimize=True)
+            dados = buf.getvalue()
+            if len(dados) <= MAX_BYTES_FOTO:
+                return dados
+        lado = int(lado * 0.82)                    # reduz a dimensão e tenta de novo
+        if lado < 800:
+            break
+    return dados                                   # caso extremo: menor tamanho obtido
+
+
+def salvar_anexo(solic_id, nome, dados):
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO anexos (solicitacao_id, nome, mime, tamanho, imagem) "
+            "VALUES (:s, :n, :m, :t, :img)"),
+            {"s": int(solic_id), "n": nome, "m": "image/jpeg",
+             "t": len(dados), "img": dados})
+
+
+def anexos_da(solic_id):
+    return pd.read_sql(text("SELECT id, nome, tamanho, imagem FROM anexos "
+                            "WHERE solicitacao_id = :s ORDER BY id"),
+                       engine, params={"s": int(solic_id)})
+
+
+def contar_anexos(df):
+    """Retorna dict {solicitacao_id: qtd} para exibir nas listagens."""
+    try:
+        c = pd.read_sql("SELECT solicitacao_id, COUNT(*) AS n FROM anexos "
+                        "GROUP BY solicitacao_id", engine)
+        return dict(zip(c["solicitacao_id"], c["n"]))
+    except Exception:
+        return {}
+
+
+def excluir_anexo(anexo_id):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM anexos WHERE id = :i"), {"i": int(anexo_id)})
+
+
+def excluir_demanda(id_alvo):
+    # os anexos saem junto (ON DELETE CASCADE); apagamos explicitamente por garantia
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM anexos WHERE solicitacao_id = :i"), {"i": int(id_alvo)})
+        conn.execute(text("DELETE FROM solicitacoes WHERE id = :i"), {"i": int(id_alvo)})
+
+
 # ================================================================== #
 #  PÁGINA: HOME
 # ================================================================== #
@@ -355,58 +435,149 @@ def pg_cadastro():
     cabecalho("CADASTRAMENTO DE DEMANDAS")
     if not _base_ok():
         return
-    st.caption("O ID é gerado automaticamente pelo banco de dados.")
+    st.caption("O ID é gerado automaticamente pelo banco de dados. Campos com * são obrigatórios.")
     LIS = carregar_listas()
-    with st.form("form_cad", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            solicitante_sel = st.selectbox("Solicitante *", ["(selecione)"] + LIS.get("Solicitante", []))
-            solicitante_novo = st.text_input("…ou novo solicitante (se não estiver na lista)")
-            complexo = st.selectbox("Complexo *", LIS["Complexo"])
-            tipo_estrutura = st.selectbox("Tipo de Estrutura *", LIS["Tipo de Estrutura"])
-            localizacao = st.text_area("Localização da Estrutura", height=90)
-            coord_x = st.number_input("Coordenada X (WGS84)", format="%.6f", value=0.0)
-        with c2:
-            area = st.selectbox("Área do Solicitante *", LIS["Área do Solicitante"])
-            tipo_solic = st.selectbox("Tipo de Solicitação *", LIS["Tipo de Solicitação"])
-            estrutura = st.selectbox("Estrutura *", LIS["Estrutura"])
-            descricao = st.text_area("Descrição do Evento ou Projeto", height=90)
-            coord_y = st.number_input("Coordenada Y (WGS84)", format="%.6f", value=0.0)
-        st.caption("Obs.: o solicitante deverá acompanhar em campo as tratativas com o "
-                   "geotécnico responsável. Telefone da Geomecânica: (94) 99944-2667.")
-        enviar = st.form_submit_button("ENVIAR SOLICITAÇÃO", type="primary", use_container_width=True)
-    if enviar:
-        solic = solicitante_novo.strip() or ("" if solicitante_sel == "(selecione)" else solicitante_sel)
-        if not solic:
-            st.error("Informe o Solicitante (selecione na lista ou digite um novo).")
+
+    def campo_outros(label, chave, opcoes):
+        """Selectbox com opção 'Outros'; ao escolher, libera um campo para digitar."""
+        lst = list(opcoes)
+        if "Outros" not in lst:
+            lst = lst + ["Outros"]
+        sel = st.selectbox(f"{label} *", ["(selecione)"] + lst, key=f"cad_sel_{chave}")
+        if sel == "Outros":
+            return st.text_input(f"↳ Especifique {label.lower()}", key=f"cad_out_{chave}").strip()
+        return "" if sel == "(selecione)" else sel
+
+    c1, c2 = st.columns(2)
+    with c1:
+        # Solicitante: lista + opção de novo nome (entra na lista ao cadastrar)
+        sol_opts = ["(selecione)"] + LIS.get("Solicitante", []) + ["Outros (novo)"]
+        sol_sel = st.selectbox("Solicitante *", sol_opts, key="cad_sel_sol")
+        if sol_sel == "Outros (novo)":
+            solicitante = st.text_input("↳ Nome do novo solicitante", key="cad_out_sol").strip()
+            solicitante_novo = bool(solicitante)
         else:
-            if solicitante_novo.strip() and solicitante_novo.strip() not in LIS.get("Solicitante", []):
+            solicitante = "" if sol_sel == "(selecione)" else sol_sel
+            solicitante_novo = False
+        complexo = campo_outros("Complexo", "complexo", LIS["Complexo"])
+        tipo_estrutura = campo_outros("Tipo de Estrutura", "testrut", LIS["Tipo de Estrutura"])
+        localizacao = st.text_area("Localização da Estrutura", height=90, key="cad_loc")
+    with c2:
+        area = campo_outros("Área do Solicitante", "area", LIS["Área do Solicitante"])
+        tipo_solic = campo_outros("Tipo de Solicitação", "tsolic", LIS["Tipo de Solicitação"])
+        estrutura = campo_outros("Estrutura", "estrut", LIS["Estrutura"])
+        descricao = st.text_area("Descrição do Evento ou Projeto", height=90, key="cad_desc")
+
+    # ---- Coordenadas (com mapa interativo opcional) ----
+    st.markdown("**Coordenadas (WGS84)** — clique no mapa ou digite manualmente")
+    st.session_state.setdefault("cad_x", 0.0)
+    st.session_state.setdefault("cad_y", 0.0)
+    with st.expander("📍 Selecionar coordenadas no mapa (clique no ponto)"):
+        try:
+            import folium
+            from streamlit_folium import st_folium
+            lat0 = st.session_state.cad_x or -6.05
+            lon0 = st.session_state.cad_y or -50.16
+            m = folium.Map(location=[lat0, lon0], zoom_start=11, control_scale=True)
+            if st.session_state.cad_x and st.session_state.cad_y:
+                folium.Marker([st.session_state.cad_x, st.session_state.cad_y],
+                              tooltip="Ponto selecionado").add_to(m)
+            md = st_folium(m, height=350, width=725, key="cad_map")
+            if md and md.get("last_clicked"):
+                st.session_state.cad_x = round(md["last_clicked"]["lat"], 6)
+                st.session_state.cad_y = round(md["last_clicked"]["lng"], 6)
+            st.caption("Convenção do app: X = Latitude · Y = Longitude.")
+        except Exception:
+            st.info("Mapa indisponível agora — digite as coordenadas manualmente abaixo.")
+    cc1, cc2 = st.columns(2)
+    coord_x = cc1.number_input("Coordenada X (Latitude)", format="%.6f", key="cad_x")
+    coord_y = cc2.number_input("Coordenada Y (Longitude)", format="%.6f", key="cad_y")
+
+    # ---- Anexos de fotos ----
+    st.markdown(f"**Anexos — fotos da inspeção** · até {MAX_FOTOS} fotos, "
+                f"{MAX_BYTES_FOTO//1_000_000} MB por foto e "
+                f"{MAX_BYTES_TOTAL//1_000_000} MB no total (comprimidas automaticamente)")
+    fotos = st.file_uploader("Selecionar fotos (JPG/PNG)", type=["jpg", "jpeg", "png"],
+                             accept_multiple_files=True, key="cad_fotos")
+    if fotos and len(fotos) > MAX_FOTOS:
+        st.warning(f"Você selecionou {len(fotos)} fotos; o máximo é {MAX_FOTOS}. "
+                   f"Apenas as {MAX_FOTOS} primeiras serão anexadas.")
+
+    st.caption("Obs.: o solicitante deverá acompanhar em campo as tratativas com o "
+               "geotécnico responsável. Telefone da Geomecânica: (94) 99944-2667.")
+    enviar = st.button("ENVIAR SOLICITAÇÃO", type="primary", use_container_width=True)
+
+    if enviar:
+        obrig = [("Solicitante", solicitante), ("Complexo", complexo),
+                 ("Área do Solicitante", area), ("Tipo de Solicitação", tipo_solic),
+                 ("Tipo de Estrutura", tipo_estrutura), ("Estrutura", estrutura)]
+        faltando = [nome for nome, val in obrig if not val]
+        if faltando:
+            st.error("Preencha os campos obrigatórios: " + ", ".join(faltando) + ".")
+        else:
+            # Processa/comprime as fotos ANTES de gravar (evita registro órfão)
+            processadas, total, erro = [], 0, None
+            fotos_lim = (fotos or [])[:MAX_FOTOS]
+            if fotos_lim:
+                pb = st.progress(0.0, text="Processando fotos...")
+                for i, f in enumerate(fotos_lim):
+                    try:
+                        dados = comprimir_imagem(f.getvalue())
+                    except Exception:
+                        erro = f"Não foi possível processar a imagem '{f.name}'."
+                        break
+                    total += len(dados)
+                    processadas.append((f.name, dados))
+                    pb.progress((i + 1) / len(fotos_lim),
+                                text=f"Processando foto {i + 1}/{len(fotos_lim)}...")
+                pb.empty()
+            if erro:
+                st.error(erro + " Remova essa imagem e tente novamente.")
+            elif total > MAX_BYTES_TOTAL:
+                st.error(f"O total das fotos ficou em {total/1_000_000:.1f} MB, acima do "
+                         f"limite de {MAX_BYTES_TOTAL//1_000_000} MB. Remova alguma foto.")
+            else:
+                reg = {"data_criacao": date.today(), "solicitante": solicitante,
+                       "area_solicitante": area, "complexo": complexo,
+                       "tipo_solicitacao": tipo_solic, "tipo_estrutura": tipo_estrutura,
+                       "estrutura": estrutura, "localizacao": (localizacao or "").strip(),
+                       "descricao": (descricao or "").strip(),
+                       "coord_x": coord_x or None, "coord_y": coord_y or None,
+                       "responsavel": None, "status": "Aguardando avaliação",
+                       "resultado_avaliacao": None, "aprovador": None,
+                       "data_resposta": None, "comentarios": None, "plano_acao": None}
                 try:
-                    lista_add("Solicitante", solicitante_novo.strip())
-                except Exception:
-                    pass
-            reg = {"data_criacao": date.today(), "solicitante": solic,
-                   "area_solicitante": area, "complexo": complexo,
-                   "tipo_solicitacao": tipo_solic, "tipo_estrutura": tipo_estrutura,
-                   "estrutura": estrutura, "localizacao": localizacao.strip(),
-                   "descricao": descricao.strip(),
-                   "coord_x": coord_x or None, "coord_y": coord_y or None,
-                   "responsavel": None, "status": "Aguardando avaliação",
-                   "resultado_avaliacao": None, "aprovador": None,
-                   "data_resposta": None, "comentarios": None, "plano_acao": None}
-            try:
-                novo_id = gravar_nova(reg)
-                st.cache_data.clear()
-                st.success(f"Solicitação cadastrada com sucesso! ID gerado: {novo_id}")
-            except Exception as e:
-                st.error(f"Erro ao salvar: {e}")
+                    novo_id = gravar_nova(reg)
+                    for nome, dados in processadas:
+                        salvar_anexo(novo_id, nome, dados)
+                    if solicitante_novo and solicitante not in LIS.get("Solicitante", []):
+                        try:
+                            lista_add("Solicitante", solicitante)
+                        except Exception:
+                            pass
+                    st.cache_data.clear()
+                    msg = f"Solicitação cadastrada com sucesso! ID gerado: {novo_id}."
+                    if processadas:
+                        msg += f" {len(processadas)} foto(s) anexada(s) ({total/1_000_000:.1f} MB)."
+                    st.success(msg)
+                    for k in ["cad_sel_sol", "cad_out_sol", "cad_sel_complexo", "cad_out_complexo",
+                              "cad_sel_area", "cad_out_area", "cad_sel_tsolic", "cad_out_tsolic",
+                              "cad_sel_testrut", "cad_out_testrut", "cad_sel_estrut", "cad_out_estrut",
+                              "cad_loc", "cad_desc", "cad_fotos", "cad_x", "cad_y"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Erro ao salvar: {e}")
+
     st.divider()
     st.markdown("##### Últimas solicitações cadastradas")
     u = carregar().sort_values("ID", ascending=False).head(8)
+    qtd = contar_anexos(u)
     cu = [c for c in ["ID", "Data de criação", "Solicitante", "Complexo",
                       "Tipo de Estrutura", "Estrutura", "Status"] if c in u.columns]
     u = u[cu].copy()
     u["Data de criação"] = u["Data de criação"].dt.strftime("%d/%m/%Y")
+    u["Fotos"] = u["ID"].map(lambda i: qtd.get(i, 0))
     st.dataframe(u, use_container_width=True, hide_index=True)
 
 
@@ -449,6 +620,27 @@ def pg_gestao():
                   linha["Descrição do Evento ou Projeto"]],
     }), use_container_width=True, hide_index=True)
 
+    # Fotos anexadas a esta demanda
+    fotos_df = anexos_da(alvo)
+    st.markdown(f"**Fotos anexadas ({len(fotos_df)})**")
+    if fotos_df.empty:
+        st.caption("Nenhuma foto anexada a esta solicitação.")
+    else:
+        gcols = st.columns(min(len(fotos_df), 5))
+        for i, (_, r) in enumerate(fotos_df.iterrows()):
+            with gcols[i % 5]:
+                st.image(bytes(r["imagem"]),
+                         caption=f"{r['nome']} ({r['tamanho']/1000:.0f} KB)",
+                         use_container_width=True)
+                if st.button("🗑️ Excluir foto", key=f"delfoto_{r['id']}", use_container_width=True):
+                    try:
+                        excluir_anexo(int(r["id"]))
+                        st.cache_data.clear()
+                        st.success("Foto excluída.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao excluir foto: {e}")
+
     def _idx(lista, valor, extra0=None):
         opts = ([extra0] if extra0 is not None else []) + lista
         v = "" if pd.isna(valor) else str(valor)
@@ -490,6 +682,23 @@ def pg_gestao():
             st.success(f"Demanda ID {alvo} atualizada com sucesso!")
         except Exception as e:
             st.error(f"Erro ao salvar: {e}")
+
+    # ---------------- Excluir solicitação ----------------
+    st.divider()
+    with st.expander("🗑️ Excluir esta solicitação (ação irreversível)"):
+        st.warning(f"Isto apaga permanentemente a solicitação ID {alvo} "
+                   f"e todas as fotos anexadas a ela.")
+        conf = st.checkbox("Confirmo que desejo excluir esta solicitação.", key="conf_del_sol")
+        if st.button("Excluir definitivamente", type="primary",
+                     disabled=not conf, key="btn_del_sol", use_container_width=True):
+            try:
+                excluir_demanda(int(alvo))
+                st.cache_data.clear()
+                st.session_state.pop("conf_del_sol", None)
+                st.success(f"Solicitação ID {alvo} excluída com sucesso.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Erro ao excluir: {e}")
 
     # ---------------- Gerenciar listas de opções ----------------
     st.divider()
