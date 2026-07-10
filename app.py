@@ -478,7 +478,18 @@ def pg_cadastro():
             from streamlit_folium import st_folium
             lat0 = st.session_state.cad_x or -6.05
             lon0 = st.session_state.cad_y or -50.16
-            m = folium.Map(location=[lat0, lon0], zoom_start=11, control_scale=True)
+            m = folium.Map(location=[lat0, lon0], zoom_start=13,
+                           control_scale=True, tiles=None)
+            # Camada padrão: satélite (Esri World Imagery)
+            folium.TileLayer(
+                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
+                      "World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                attr="Esri, Maxar, Earthstar Geographics",
+                name="Satélite", overlay=False, control=True).add_to(m)
+            # Camada alternativa: mapa de ruas
+            folium.TileLayer("OpenStreetMap", name="Mapa de ruas",
+                             overlay=False, control=True).add_to(m)
+            folium.LayerControl(collapsed=False).add_to(m)
             if st.session_state.cad_x and st.session_state.cad_y:
                 folium.Marker([st.session_state.cad_x, st.session_state.cad_y],
                               tooltip="Ponto selecionado").add_to(m)
@@ -486,7 +497,8 @@ def pg_cadastro():
             if md and md.get("last_clicked"):
                 st.session_state.cad_x = round(md["last_clicked"]["lat"], 6)
                 st.session_state.cad_y = round(md["last_clicked"]["lng"], 6)
-            st.caption("Convenção do app: X = Latitude · Y = Longitude.")
+            st.caption("Convenção do app: X = Latitude · Y = Longitude. "
+                       "Use o seletor no canto do mapa para alternar Satélite / Ruas.")
         except Exception:
             st.info("Mapa indisponível agora — digite as coordenadas manualmente abaixo.")
     cc1, cc2 = st.columns(2)
