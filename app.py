@@ -781,7 +781,7 @@ def pg_dashboard():
            "Estrutura": f3.selectbox("Estrutura", opcoes("Estrutura")),
            "Status": f4.selectbox("Status", opcoes("Status")),
            "Solicitante": f5.selectbox("Solicitante", opcoes("Solicitante")),
-           "Responsável pela avaliação": f6.selectbox("Responsável", opcoes("Responsável pela avaliação"))}
+           "Responsável pela avaliação": f6.selectbox("Responsável pela avaliação", opcoes("Responsável pela avaliação"))}
     dmin, dmax = dados["Data de criação"].min(), dados["Data de criação"].max()
     periodo = st.date_input("Período (Data de criação)", value=(dmin.date(), dmax.date()),
                             min_value=dmin.date(), max_value=dmax.date())
