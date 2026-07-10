@@ -516,7 +516,7 @@ def pg_cadastro():
                    f"Apenas as {MAX_FOTOS} primeiras serão anexadas.")
 
     st.caption("Obs.: o solicitante deverá acompanhar em campo as tratativas com o "
-               "geotécnico responsável. Telefone da Geomecânica: (94) 99944-2667.")
+               "geotécnico responsável.")
     enviar = st.button("ENVIAR SOLICITAÇÃO", type="primary", use_container_width=True)
 
     if enviar:
