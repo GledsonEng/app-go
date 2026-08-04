@@ -173,7 +173,7 @@ PAGES = {}
 # ------------------------------------------------------------------ #
 st.markdown(f"""
 <style>
-  .block-container {{ padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1300px; }}
+  .block-container {{ padding-top: 3rem; padding-bottom: 2rem; max-width: 1300px; }}
   .home-wrap {{ position:relative; border-radius:12px; overflow:hidden; min-height:430px;
     padding:44px 50px;
     background:
@@ -195,6 +195,11 @@ st.markdown(f"""
     background:{GOLD}; color:{TEAL_D}; font-weight:800; font-size:16px; border:none;
     border-radius:8px; padding:18px 10px; width:100%; box-shadow:0 3px 10px rgba(0,0,0,.18); transition:.15s; }}
   div[data-testid="column"] div.stButton > button:hover {{ background:#ffca2c; color:#000; transform:translateY(-1px); }}
+  .st-key-btn_voltar button {{ background:#ffffff; color:{TEAL_D}; border:1px solid {TEAL};
+    font-weight:600; font-size:14px; border-radius:8px; padding:6px 16px; width:auto;
+    box-shadow:none; }}
+  .st-key-btn_voltar button:hover {{ background:{TEAL_L}; color:#ffffff; border-color:{TEAL_L}; }}
+  .st-key-btn_voltar button p {{ color:inherit; }}
   .vale-header {{ background: linear-gradient(105deg, {TEAL_D} 0%, {TEAL} 48%, {TEAL_L} 100%);
     border-radius:6px; padding:14px 22px; margin-bottom:10px; display:flex; align-items:center;
     justify-content:space-between; border-bottom:3px solid {GOLD}; }}
@@ -225,7 +230,7 @@ def cabecalho(subtitulo):
 
 
 def botao_inicio():
-    if st.button("← Voltar à tela inicial"):
+    if st.button("← Voltar à tela inicial", key="btn_voltar"):
         st.switch_page(PAGES["home"])
 
 
