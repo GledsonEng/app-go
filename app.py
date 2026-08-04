@@ -317,11 +317,12 @@ def lista_add(lista, valor):
             "ON CONFLICT (lista, valor) DO NOTHING"), {"l": lista, "v": valor})
 
 
-def lista_add(lista, valor, grupo=None):
+def lista_add(lista, valor, grupo=None, complexo=None):
     with engine.begin() as conn:
         conn.execute(text(
-            "INSERT INTO listas_opcoes (lista, valor, grupo) VALUES (:l, :v, :g) "
-            "ON CONFLICT (lista, valor) DO NOTHING"), {"l": lista, "v": valor, "g": grupo})
+            "INSERT INTO listas_opcoes (lista, valor, grupo, complexo) "
+            "VALUES (:l, :v, :g, :c) ON CONFLICT (lista, valor) DO NOTHING"),
+            {"l": lista, "v": valor, "g": grupo, "c": complexo})
 
 
 def lista_del(lista, valor):
@@ -345,11 +346,28 @@ def estruturas_por_tipo():
         return {}
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def estruturas_meta():
+    """Estruturas com seu Tipo (grupo) e Complexo. Colunas: valor, grupo, complexo."""
+    try:
+        return pd.read_sql("SELECT valor, grupo, complexo FROM listas_opcoes "
+                           "WHERE lista = 'Estrutura' ORDER BY valor", engine)
+    except Exception:
+        return pd.DataFrame(columns=["valor", "grupo", "complexo"])
+
+
 def estrutura_set_tipo(valor, grupo):
     with engine.begin() as conn:
         conn.execute(text("UPDATE listas_opcoes SET grupo = :g "
                           "WHERE lista = 'Estrutura' AND valor = :v"),
                      {"g": grupo, "v": valor})
+
+
+def estrutura_set_meta(valor, grupo, complexo):
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE listas_opcoes SET grupo = :g, complexo = :c "
+                          "WHERE lista = 'Estrutura' AND valor = :v"),
+                     {"g": grupo, "c": complexo, "v": valor})
 
 
 # ---- Anexos de fotos (armazenados no próprio banco) ----
@@ -596,22 +614,29 @@ def pg_cadastro():
     with c2:
         area = campo_outros("Área do Solicitante", "area", LIS["Área do Solicitante"])
         tipo_solic = campo_outros("Tipo de Solicitação", "tsolic", LIS["Tipo de Solicitação"])
-        # Estrutura filtrada pelo Tipo de Estrutura selecionado (evita erro de cadastro)
-        ept = estruturas_por_tipo()
-        sem_tipo = ept.get("(sem tipo)", [])
-        if not tipo_estrutura:
-            st.selectbox("Estrutura *", ["(selecione o Tipo de Estrutura primeiro)"],
+        # Estrutura filtrada por Complexo + Tipo de Estrutura (evita erro de cadastro)
+        dfm = estruturas_meta()
+        if dfm.empty:
+            classificadas, nao_class = dfm, dfm
+        else:
+            mask = (dfm["grupo"].notna() & (dfm["grupo"].astype(str) != "") &
+                    dfm["complexo"].notna() & (dfm["complexo"].astype(str) != ""))
+            classificadas, nao_class = dfm[mask], dfm[~mask]
+        if not (complexo and tipo_estrutura):
+            st.selectbox("Estrutura *", ["(selecione Complexo e Tipo de Estrutura primeiro)"],
                          disabled=True, key="cad_sel_estrut_ph")
             estrutura = ""
         else:
-            if tipo_estrutura in ept:
-                ops_estrut = ept[tipo_estrutura] + sem_tipo
-            else:                       # tipo digitado em "Outros" ou sem estruturas vinculadas
-                ops_estrut = sem_tipo
+            if not classificadas.empty:
+                match = classificadas[(classificadas["complexo"] == complexo) &
+                                      (classificadas["grupo"] == tipo_estrutura)]
+                ops_estrut = list(match["valor"]) + list(nao_class["valor"])
+            else:
+                ops_estrut = list(nao_class["valor"])
             estrutura = campo_outros("Estrutura", "estrut", ops_estrut)
-            if sem_tipo:
-                st.caption(f"⚠️ {len(sem_tipo)} estrutura(s) ainda sem tipo definido aparecem "
-                           f"em todos os tipos. Classifique-as em Gestão (ADM).")
+            if not nao_class.empty:
+                st.caption(f"⚠️ {len(nao_class)} estrutura(s) ainda sem Tipo/Complexo definido "
+                           f"aparecem em todos. Classifique-as em Gestão (ADM).")
         descricao = st.text_area("Descrição do Evento ou Projeto", height=90, key="cad_desc")
 
     # ---- Coordenadas (com mapa interativo opcional) ----
@@ -905,33 +930,39 @@ def pg_gestao():
         st.markdown(f"**Opções atuais de _{nome_lista}_ — {len(valores)} item(ns):**")
 
         if eh_estrutura:
-            # Vínculo Estrutura -> Tipo de Estrutura (classificação editável)
+            # Vínculo Estrutura -> Tipo + Complexo (classificação editável)
             tipos_estr = LIS_G.get("Tipo de Estrutura", [])
-            ept = estruturas_por_tipo()
-            linhas = []
-            for grupo, ests in ept.items():
-                for e in ests:
-                    linhas.append({"Estrutura": e,
-                                   "Tipo de Estrutura": "" if grupo == "(sem tipo)" else grupo})
-            dfc = pd.DataFrame(linhas).sort_values("Estrutura").reset_index(drop=True) \
-                if linhas else pd.DataFrame({"Estrutura": [], "Tipo de Estrutura": []})
-            st.caption("Defina o Tipo de cada Estrutura. No Cadastramento, ao escolher o Tipo, "
-                       "só aparecem as estruturas daquele tipo.")
+            complexos = LIS_G.get("Complexo", [])
+            dfm = estruturas_meta()
+            if not dfm.empty:
+                dfc = pd.DataFrame({
+                    "Estrutura": dfm["valor"],
+                    "Tipo de Estrutura": dfm["grupo"].fillna(""),
+                    "Complexo": dfm["complexo"].fillna("")}).reset_index(drop=True)
+            else:
+                dfc = pd.DataFrame({"Estrutura": [], "Tipo de Estrutura": [], "Complexo": []})
+            st.caption("Defina o Tipo e o Complexo de cada Estrutura. No Cadastramento, ao escolher "
+                       "Complexo + Tipo, só aparecem as estruturas que batem com os dois.")
             editado = st.data_editor(
-                dfc, use_container_width=True, hide_index=True, height=300, key="editor_estrut",
+                dfc, use_container_width=True, hide_index=True, height=320, key="editor_estrut",
                 column_config={
                     "Estrutura": st.column_config.TextColumn("Estrutura", disabled=True),
                     "Tipo de Estrutura": st.column_config.SelectboxColumn(
-                        "Tipo de Estrutura", options=tipos_estr)})
-            if st.button("💾 Salvar tipos das estruturas", use_container_width=True, key="btn_save_tipos"):
+                        "Tipo de Estrutura", options=tipos_estr),
+                    "Complexo": st.column_config.SelectboxColumn(
+                        "Complexo", options=complexos)})
+            if st.button("💾 Salvar Tipo/Complexo das estruturas",
+                         use_container_width=True, key="btn_save_tipos"):
                 try:
-                    antigo = {r["Estrutura"]: r["Tipo de Estrutura"] for _, r in dfc.iterrows()}
+                    ant = {r["Estrutura"]: (r["Tipo de Estrutura"], r["Complexo"])
+                           for _, r in dfc.iterrows()}
                     for _, r in editado.iterrows():
-                        novo_t = (r["Tipo de Estrutura"] or "").strip()
-                        if antigo.get(r["Estrutura"], "") != novo_t:
-                            estrutura_set_tipo(r["Estrutura"], novo_t or None)
+                        nt = (r["Tipo de Estrutura"] or "").strip()
+                        nc = (r["Complexo"] or "").strip()
+                        if ant.get(r["Estrutura"], ("", "")) != (nt, nc):
+                            estrutura_set_meta(r["Estrutura"], nt or None, nc or None)
                     st.cache_data.clear()
-                    st.success("Tipos das estruturas atualizados.")
+                    st.success("Tipo/Complexo das estruturas atualizados.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Erro ao salvar: {e}")
@@ -944,22 +975,28 @@ def pg_gestao():
         ca, cb = st.columns(2)
         with ca:
             novo_v = st.text_input("Adicionar nova opção", key="add_opt_g")
-            tipo_novo = None
+            tipo_novo = complexo_novo = None
             if eh_estrutura:
                 tipo_novo = st.selectbox("Tipo desta estrutura",
                                          ["(selecione)"] + LIS_G.get("Tipo de Estrutura", []),
                                          key="add_tipo_estrut")
+                complexo_novo = st.selectbox("Complexo desta estrutura",
+                                             ["(selecione)"] + LIS_G.get("Complexo", []),
+                                             key="add_complexo_estrut")
             if st.button("➕ Adicionar", use_container_width=True, key="btn_add_g"):
                 v = novo_v.strip()
                 if not v:
                     st.warning("Digite um valor para adicionar.")
                 elif v in valores:
                     st.warning("Essa opção já existe na lista.")
-                elif eh_estrutura and (not tipo_novo or tipo_novo == "(selecione)"):
-                    st.warning("Selecione o Tipo desta estrutura.")
+                elif eh_estrutura and (not tipo_novo or tipo_novo == "(selecione)"
+                                       or not complexo_novo or complexo_novo == "(selecione)"):
+                    st.warning("Selecione o Tipo e o Complexo desta estrutura.")
                 else:
                     try:
-                        lista_add(nome_lista, v, grupo=(tipo_novo if eh_estrutura else None))
+                        lista_add(nome_lista, v,
+                                  grupo=(tipo_novo if eh_estrutura else None),
+                                  complexo=(complexo_novo if eh_estrutura else None))
                         st.cache_data.clear()
                         st.success(f"'{v}' adicionado a {nome_lista}.")
                         st.rerun()
