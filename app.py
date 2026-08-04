@@ -60,7 +60,7 @@ def _bootstrap():
     necessarios = [("pandas", "pandas"), ("plotly", "plotly"),
                    ("sqlalchemy", "sqlalchemy"), ("psycopg2", "psycopg2-binary"),
                    ("PIL", "pillow"), ("folium", "folium"),
-                   ("streamlit_folium", "streamlit-folium"),
+                   ("streamlit_folium", "streamlit-folium"), ("fpdf", "fpdf2"),
                    ("streamlit", "streamlit")]
     faltando = [pip for mod, pip in necessarios if importlib.util.find_spec(mod) is None]
     if faltando:
@@ -146,7 +146,7 @@ LISTAS_DEFAULT = {
         "Terraplenagem N5", "Geotecnia", "Meio Ambiente", "Operação de Mina N4",
         "Perfuração / Desmonte", "Operação de Mina N5", "Sondagem",
         "Geociências - Topografia"],
-    "Complexo": ["Serra Norte", "Serra Leste", "Mn"],
+    "Complexo": ["Serra Norte", "Serra Leste", "Manganês"],
     "Tipo de Solicitação": ["Inspeção Geotécnica", "Avaliação de Projeto / Plano",
         "Elaboração de Seções", "Entrega de obra"],
     "Tipo de Estrutura": ["Cava", "Usina e Acessos", "Pilha de Estéril", "Pilha de Produto"],
@@ -317,10 +317,39 @@ def lista_add(lista, valor):
             "ON CONFLICT (lista, valor) DO NOTHING"), {"l": lista, "v": valor})
 
 
+def lista_add(lista, valor, grupo=None):
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO listas_opcoes (lista, valor, grupo) VALUES (:l, :v, :g) "
+            "ON CONFLICT (lista, valor) DO NOTHING"), {"l": lista, "v": valor, "g": grupo})
+
+
 def lista_del(lista, valor):
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM listas_opcoes WHERE lista = :l AND valor = :v"),
                      {"l": lista, "v": valor})
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def estruturas_por_tipo():
+    """Retorna {tipo_de_estrutura: [estruturas]} e as não classificadas em '(sem tipo)'."""
+    try:
+        df = pd.read_sql("SELECT valor, grupo FROM listas_opcoes "
+                         "WHERE lista = 'Estrutura' ORDER BY valor", engine)
+        d = {}
+        for _, r in df.iterrows():
+            chave = r["grupo"] if pd.notna(r["grupo"]) and r["grupo"] else "(sem tipo)"
+            d.setdefault(chave, []).append(r["valor"])
+        return d
+    except Exception:
+        return {}
+
+
+def estrutura_set_tipo(valor, grupo):
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE listas_opcoes SET grupo = :g "
+                          "WHERE lista = 'Estrutura' AND valor = :v"),
+                     {"g": grupo, "v": valor})
 
 
 # ---- Anexos de fotos (armazenados no próprio banco) ----
@@ -400,6 +429,98 @@ def excluir_demanda(id_alvo):
         conn.execute(text("DELETE FROM solicitacoes WHERE id = :i"), {"i": int(id_alvo)})
 
 
+def _txt(s):
+    """Sanitiza texto para o PDF (fontes core usam latin-1)."""
+    if s is None:
+        return "-"
+    return str(s).encode("latin-1", "replace").decode("latin-1")
+
+
+def gerar_pdf(linha, fotos_df):
+    """Monta um relatório PDF do chamado com dados, coordenadas e fotos."""
+    from fpdf import FPDF
+    from fpdf.enums import XPos, YPos
+    NX, NY = XPos.LMARGIN, YPos.NEXT
+    pdf = FPDF(unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    # Cabeçalho VALE
+    pdf.set_fill_color(14, 77, 73)
+    pdf.rect(0, 0, 210, 24, "F")
+    pdf.set_xy(10, 6)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 6, _txt("VALE - Solicitacao de Avaliacao Geotecnica"), new_x=NX, new_y=NY)
+    pdf.set_x(10)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, _txt("Geotecnia Operacional - Corredor Norte"), new_x=NX, new_y=NY)
+    pdf.ln(6)
+    pdf.set_text_color(0, 0, 0)
+
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 8, _txt(f"Chamado ID {linha['ID']}  -  Status: {linha['Status']}"),
+             new_x=NX, new_y=NY)
+    pdf.ln(2)
+
+    def campo(rotulo, valor):
+        y0 = pdf.get_y()
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_fill_color(235, 240, 239)
+        pdf.cell(55, 7, _txt(rotulo), border=0, fill=True,
+                 new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_xy(65, y0)
+        pdf.multi_cell(135, 7, _txt(valor), border=0, new_x=NX, new_y=NY)
+
+    def _data(v):
+        try:
+            return v.strftime("%d/%m/%Y")
+        except Exception:
+            return "-" if v is None else str(v)
+
+    campo("Data de criacao", _data(linha.get("Data de criação")))
+    campo("Solicitante", linha.get("Solicitante"))
+    campo("Area do Solicitante", linha.get("Área do Solicitante"))
+    campo("Complexo", linha.get("Complexo"))
+    campo("Tipo de Solicitacao", linha.get("Tipo de Solicitação"))
+    campo("Tipo de Estrutura", linha.get("Tipo de Estrutura"))
+    campo("Estrutura", linha.get("Estrutura"))
+    campo("Localizacao", linha.get("Localização da Estrutura"))
+    cx, cy = linha.get("Coordenada X (WGS84)"), linha.get("Coordenada Y (WGS84)")
+    coord = "-"
+    if cx not in (None, "") and cy not in (None, "") and not (pd.isna(cx) or pd.isna(cy)):
+        coord = f"Lat {cx:.6f} , Lon {cy:.6f}"
+    campo("Coordenadas (X=Lat, Y=Lon)", coord)
+    campo("Descricao do Evento/Projeto", linha.get("Descrição do Evento ou Projeto"))
+    campo("Responsavel pela avaliacao", linha.get("Responsável pela avaliação"))
+    campo("Resultado da avaliacao", linha.get("Resultado da avaliação"))
+    campo("Aprovador", linha.get("Aprovador"))
+    campo("Data da Resposta", _data(linha.get("Data da Resposta")))
+    campo("Comentarios", linha.get("Comentários"))
+    campo("Plano de Acao", linha.get("Plano de Ação"))
+
+    # Fotos
+    if fotos_df is not None and not fotos_df.empty:
+        pdf.ln(3)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, _txt(f"Fotos anexadas ({len(fotos_df)})"), new_x=NX, new_y=NY)
+        for _, r in fotos_df.iterrows():
+            try:
+                img = io.BytesIO(bytes(r["imagem"]))
+                if pdf.get_y() > 240:
+                    pdf.add_page()
+                pdf.image(img, w=120)
+                pdf.set_font("Helvetica", "I", 8)
+                pdf.cell(0, 5, _txt(f"{r['nome']} ({r['tamanho']/1000:.0f} KB)"),
+                         new_x=NX, new_y=NY)
+                pdf.ln(2)
+            except Exception:
+                pdf.set_font("Helvetica", "I", 8)
+                pdf.cell(0, 5, _txt(f"[falha ao inserir {r['nome']}]"), new_x=NX, new_y=NY)
+
+    return bytes(pdf.output())
+
+
 # ================================================================== #
 #  PÁGINA: HOME
 # ================================================================== #
@@ -436,6 +557,16 @@ def pg_cadastro():
     if not _base_ok():
         return
     st.caption("O ID é gerado automaticamente pelo banco de dados. Campos com * são obrigatórios.")
+    ok = st.session_state.pop("cad_ok", None)
+    if ok:
+        st.success("✅ Solicitação registrada com sucesso!")
+        det = (f"**Protocolo (ID): {ok['id']}** · Solicitante: {ok['solic']} · "
+               f"Status inicial: **Aguardando avaliação**.")
+        if ok["fotos"]:
+            det += f" · {ok['fotos']} foto(s) anexada(s) ({ok['mb']:.1f} MB)."
+        st.info(det + "\n\nA solicitação está registrada e disponível para a equipe de "
+                "Geotecnia avaliar. Acompanhe o andamento pela tela de Gestão.")
+        st.balloons()
     LIS = carregar_listas()
 
     def campo_outros(label, chave, opcoes):
@@ -465,7 +596,22 @@ def pg_cadastro():
     with c2:
         area = campo_outros("Área do Solicitante", "area", LIS["Área do Solicitante"])
         tipo_solic = campo_outros("Tipo de Solicitação", "tsolic", LIS["Tipo de Solicitação"])
-        estrutura = campo_outros("Estrutura", "estrut", LIS["Estrutura"])
+        # Estrutura filtrada pelo Tipo de Estrutura selecionado (evita erro de cadastro)
+        ept = estruturas_por_tipo()
+        sem_tipo = ept.get("(sem tipo)", [])
+        if not tipo_estrutura:
+            st.selectbox("Estrutura *", ["(selecione o Tipo de Estrutura primeiro)"],
+                         disabled=True, key="cad_sel_estrut_ph")
+            estrutura = ""
+        else:
+            if tipo_estrutura in ept:
+                ops_estrut = ept[tipo_estrutura] + sem_tipo
+            else:                       # tipo digitado em "Outros" ou sem estruturas vinculadas
+                ops_estrut = sem_tipo
+            estrutura = campo_outros("Estrutura", "estrut", ops_estrut)
+            if sem_tipo:
+                st.caption(f"⚠️ {len(sem_tipo)} estrutura(s) ainda sem tipo definido aparecem "
+                           f"em todos os tipos. Classifique-as em Gestão (ADM).")
         descricao = st.text_area("Descrição do Evento ou Projeto", height=90, key="cad_desc")
 
     # ---- Coordenadas (com mapa interativo opcional) ----
@@ -568,10 +714,9 @@ def pg_cadastro():
                         except Exception:
                             pass
                     st.cache_data.clear()
-                    msg = f"Solicitação cadastrada com sucesso! ID gerado: {novo_id}."
-                    if processadas:
-                        msg += f" {len(processadas)} foto(s) anexada(s) ({total/1_000_000:.1f} MB)."
-                    st.success(msg)
+                    st.session_state["cad_ok"] = {
+                        "id": novo_id, "fotos": len(processadas),
+                        "mb": total / 1_000_000, "solic": solicitante}
                     for k in ["cad_sel_sol", "cad_out_sol", "cad_sel_complexo", "cad_out_complexo",
                               "cad_sel_area", "cad_out_area", "cad_sel_tsolic", "cad_out_tsolic",
                               "cad_sel_testrut", "cad_out_testrut", "cad_sel_estrut", "cad_out_estrut",
@@ -632,6 +777,33 @@ def pg_gestao():
                   linha["Descrição do Evento ou Projeto"]],
     }), use_container_width=True, hide_index=True)
 
+    # Coordenadas + mini-mapa de satélite (para quem avalia ver o local)
+    cx, cy = linha.get("Coordenada X (WGS84)"), linha.get("Coordenada Y (WGS84)")
+    tem_coord = (cx not in (None, "") and cy not in (None, "")
+                 and not (pd.isna(cx) or pd.isna(cy)) and (cx or cy))
+    st.markdown("**Localização (coordenadas WGS84)**")
+    if tem_coord:
+        st.write(f"X (Latitude): `{cx:.6f}`  ·  Y (Longitude): `{cy:.6f}`")
+        try:
+            import folium
+            from streamlit_folium import st_folium
+            mm = folium.Map(location=[cx, cy], zoom_start=14, control_scale=True, tiles=None)
+            folium.TileLayer(
+                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
+                      "World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                attr="Esri, Maxar, Earthstar Geographics",
+                name="Satélite", control=True).add_to(mm)
+            folium.TileLayer("OpenStreetMap", name="Mapa de ruas", control=True).add_to(mm)
+            folium.LayerControl(collapsed=True).add_to(mm)
+            folium.CircleMarker([cx, cy], radius=9, color="#C0392B", weight=3,
+                                fill=True, fill_color="#C0392B", fill_opacity=0.9,
+                                tooltip="Local da solicitação").add_to(mm)
+            st_folium(mm, height=320, width=725, key=f"map_gestao_{alvo}")
+        except Exception:
+            st.info("Mini-mapa indisponível no momento. As coordenadas estão acima.")
+    else:
+        st.caption("Esta solicitação não possui coordenadas cadastradas.")
+
     # Fotos anexadas a esta demanda
     fotos_df = anexos_da(alvo)
     st.markdown(f"**Fotos anexadas ({len(fotos_df)})**")
@@ -652,6 +824,15 @@ def pg_gestao():
                         st.rerun()
                     except Exception as e:
                         st.error(f"Erro ao excluir foto: {e}")
+
+    # Exportar relatório do chamado em PDF
+    try:
+        pdf_bytes = gerar_pdf(linha, fotos_df)
+        st.download_button("📄 Exportar relatório do chamado (PDF)", data=pdf_bytes,
+                           file_name=f"chamado_{alvo}.pdf", mime="application/pdf",
+                           use_container_width=True, key=f"pdf_{alvo}")
+    except Exception as e:
+        st.caption(f"Não foi possível gerar o PDF agora: {e}")
 
     def _idx(lista, valor, extra0=None):
         opts = ([extra0] if extra0 is not None else []) + lista
@@ -720,24 +901,65 @@ def pg_gestao():
         LIS_G = carregar_listas()
         nome_lista = st.selectbox("Escolha a lista", LISTAS_GERENCIAVEIS, key="sel_lista_g")
         valores = LIS_G.get(nome_lista, [])
+        eh_estrutura = (nome_lista == "Estrutura")
         st.markdown(f"**Opções atuais de _{nome_lista}_ — {len(valores)} item(ns):**")
-        if valores:
+
+        if eh_estrutura:
+            # Vínculo Estrutura -> Tipo de Estrutura (classificação editável)
+            tipos_estr = LIS_G.get("Tipo de Estrutura", [])
+            ept = estruturas_por_tipo()
+            linhas = []
+            for grupo, ests in ept.items():
+                for e in ests:
+                    linhas.append({"Estrutura": e,
+                                   "Tipo de Estrutura": "" if grupo == "(sem tipo)" else grupo})
+            dfc = pd.DataFrame(linhas).sort_values("Estrutura").reset_index(drop=True) \
+                if linhas else pd.DataFrame({"Estrutura": [], "Tipo de Estrutura": []})
+            st.caption("Defina o Tipo de cada Estrutura. No Cadastramento, ao escolher o Tipo, "
+                       "só aparecem as estruturas daquele tipo.")
+            editado = st.data_editor(
+                dfc, use_container_width=True, hide_index=True, height=300, key="editor_estrut",
+                column_config={
+                    "Estrutura": st.column_config.TextColumn("Estrutura", disabled=True),
+                    "Tipo de Estrutura": st.column_config.SelectboxColumn(
+                        "Tipo de Estrutura", options=tipos_estr)})
+            if st.button("💾 Salvar tipos das estruturas", use_container_width=True, key="btn_save_tipos"):
+                try:
+                    antigo = {r["Estrutura"]: r["Tipo de Estrutura"] for _, r in dfc.iterrows()}
+                    for _, r in editado.iterrows():
+                        novo_t = (r["Tipo de Estrutura"] or "").strip()
+                        if antigo.get(r["Estrutura"], "") != novo_t:
+                            estrutura_set_tipo(r["Estrutura"], novo_t or None)
+                    st.cache_data.clear()
+                    st.success("Tipos das estruturas atualizados.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Erro ao salvar: {e}")
+        elif valores:
             st.dataframe(pd.DataFrame({nome_lista: valores}),
                          use_container_width=True, hide_index=True, height=220)
         else:
             st.info("Esta lista ainda não possui opções cadastradas.")
+
         ca, cb = st.columns(2)
         with ca:
             novo_v = st.text_input("Adicionar nova opção", key="add_opt_g")
+            tipo_novo = None
+            if eh_estrutura:
+                tipo_novo = st.selectbox("Tipo desta estrutura",
+                                         ["(selecione)"] + LIS_G.get("Tipo de Estrutura", []),
+                                         key="add_tipo_estrut")
             if st.button("➕ Adicionar", use_container_width=True, key="btn_add_g"):
                 v = novo_v.strip()
                 if not v:
                     st.warning("Digite um valor para adicionar.")
                 elif v in valores:
                     st.warning("Essa opção já existe na lista.")
+                elif eh_estrutura and (not tipo_novo or tipo_novo == "(selecione)"):
+                    st.warning("Selecione o Tipo desta estrutura.")
                 else:
                     try:
-                        lista_add(nome_lista, v)
+                        lista_add(nome_lista, v, grupo=(tipo_novo if eh_estrutura else None))
                         st.cache_data.clear()
                         st.success(f"'{v}' adicionado a {nome_lista}.")
                         st.rerun()

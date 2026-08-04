@@ -6,3 +6,4 @@ psycopg2-binary
 pillow
 folium
 streamlit-folium
+fpdf2
