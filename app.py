@@ -14,69 +14,6 @@ r"""
 """
 
 # ------------------------------------------------------------------ #
-# 0. BOOTSTRAP (apenas p/ rodar local; na nuvem é ignorado)
-# ------------------------------------------------------------------ #
-import os
-import sys
-import subprocess
-import importlib.util
-
-
-def _sob_streamlit():
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        return get_script_run_ctx() is not None
-    except Exception:
-        return False
-
-
-def _resolver_self():
-    try:
-        p = os.path.abspath(__file__)
-        if os.path.isfile(p):
-            return p
-    except NameError:
-        pass
-    for cand in sys.argv:
-        if isinstance(cand, str) and cand.lower().endswith(".py") and os.path.isfile(cand):
-            return os.path.abspath(cand)
-    return "app.py"
-
-
-def _preparar_streamlit():
-    try:
-        cfg = os.path.join(os.path.expanduser("~"), ".streamlit")
-        os.makedirs(cfg, exist_ok=True)
-        cred = os.path.join(cfg, "credentials.toml")
-        if not os.path.exists(cred):
-            with open(cred, "w", encoding="utf-8") as f:
-                f.write('[general]\nemail = ""\n')
-    except Exception:
-        pass
-
-
-def _bootstrap():
-    _self = _resolver_self()
-    necessarios = [("pandas", "pandas"), ("plotly", "plotly"),
-                   ("sqlalchemy", "sqlalchemy"), ("psycopg2", "psycopg2-binary"),
-                   ("PIL", "pillow"), ("folium", "folium"),
-                   ("streamlit_folium", "streamlit-folium"), ("fpdf", "fpdf2"),
-                   ("streamlit", "streamlit")]
-    faltando = [pip for mod, pip in necessarios if importlib.util.find_spec(mod) is None]
-    if faltando:
-        print(">> Instalando dependências:", ", ".join(faltando))
-        subprocess.call([sys.executable, "-m", "pip", "install", *faltando])
-    _preparar_streamlit()
-    print(">> Iniciando o site... aguarde, o navegador vai abrir.")
-    print("   (se nao abrir, acesse http://localhost:8501 )")
-    subprocess.run([sys.executable, "-m", "streamlit", "run", _self, "--server.headless=false"])
-    sys.exit(0)
-
-
-if not _sob_streamlit():
-    _bootstrap()
-
-# ------------------------------------------------------------------ #
 # 1. IMPORTS / CONFIG
 # ------------------------------------------------------------------ #
 from datetime import date
@@ -85,36 +22,29 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from sqlalchemy import create_engine, text
+from configuration import ConfigurationError, validate_settings
 
 st.set_page_config(page_title="Solicitação de Avaliação Geotécnica",
                    page_icon="📊", layout="wide")
 
-# --- Segredos (conexão e senha) ---
+# Validação antes de criar recursos ou renderizar as páginas.
 try:
-    SENHA_ADM = st.secrets["SENHA_ADM"]
-except Exception:
-    SENHA_ADM = "01124033289"   # fallback local; o ideal é definir nos Secrets
+    settings = validate_settings(st.secrets)
+except (ConfigurationError, FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
+    st.error("Configuração inválida. Defina DB_URL (PostgreSQL com host, banco, "
+             "usuário e senha) e SENHA_ADM não vazia nos Secrets. "
+             "Consulte README.md e .streamlit/secrets.toml.example.")
+    st.stop()
 
-
-def _ler_db_url():
-    try:
-        url = st.secrets["DB_URL"]
-    except Exception:
-        return None
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    return url
+SENHA_ADM = settings.admin_password
 
 
 @st.cache_resource(show_spinner=False)
-def get_engine():
-    url = _ler_db_url()
-    if not url:
-        return None
-    return create_engine(url, pool_pre_ping=True)
+def get_engine(url):
+    return create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 10})
 
 
-engine = get_engine()
+engine = get_engine(settings.database_url)
 
 TEAL_D, TEAL, TEAL_L, GOLD, BLUE = "#0A4D49", "#0E6B62", "#15857A", "#F2B705", "#3B5A86"
 STATUS_COLORS = {
@@ -246,8 +176,8 @@ def _base_ok():
         with engine.connect() as c:
             c.execute(text("SELECT 1"))
         return True
-    except Exception as e:
-        st.error(f"Não consegui conectar ao banco: {e}")
+    except Exception:
+        st.error("Não consegui conectar ao banco. Verifique DB_URL, SSL, rede e permissões.")
         return False
 
 
